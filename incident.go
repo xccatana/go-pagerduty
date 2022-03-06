@@ -57,6 +57,15 @@ type Assignee struct {
 	Assignee APIObject `json:"assignee"`
 }
 
+// Occurrence is the data around whether this is a reocurring issue.
+type Occurrence struct {
+	Count     uint   `json:"count,omitempty"`
+	Frequency uint   `json:"frequency,omitempty"`
+	Category  string `json:"category,omitempty"`
+	Since     string `json:"since,omitempty"`
+	Until     string `json:"until,omitempty"`
+}
+
 // FirstTriggerLogEntry is the first LogEntry
 type FirstTriggerLogEntry struct {
 	CommonLogEntryField
@@ -83,12 +92,15 @@ type Incident struct {
 	Priority             *Priority            `json:"priority,omitempty"`
 	Urgency              string               `json:"urgency,omitempty"`
 	Status               string               `json:"status,omitempty"`
-	Id                   string               `json:"id,omitempty"`
 	ResolveReason        ResolveReason        `json:"resolve_reason,omitempty"`
 	AlertCounts          AlertCounts          `json:"alert_counts,omitempty"`
 	Body                 IncidentBody         `json:"body,omitempty"`
 	IsMergeable          bool                 `json:"is_mergeable,omitempty"`
 	ConferenceBridge     *ConferenceBridge    `json:"conference_bridge,omitempty"`
+	AssignedVia          string               `json:"assigned_via,omitempty"`
+	Occurrence           *Occurrence          `json:"occurrence,omitempty"`
+	IncidentResponders   []IncidentResponders `json:"incidents_responders,omitempty"`
+	ResponderRequests    []ResponderRequest   `json:"responder_requests,omitempty"`
 }
 
 // ListIncidentsResponse is the response structure when calling the ListIncident API endpoint.
@@ -99,7 +111,25 @@ type ListIncidentsResponse struct {
 
 // ListIncidentsOptions is the structure used when passing parameters to the ListIncident API endpoint.
 type ListIncidentsOptions struct {
-	APIListObject
+	// Limit is the pagination parameter that limits the number of results per
+	// page. PagerDuty defaults this value to 25 if omitted, and sets an upper
+	// bound of 100.
+	Limit uint `url:"limit,omitempty"`
+
+	// Offset is the pagination parameter that specifies the offset at which to
+	// start pagination results. When trying to request the next page of
+	// results, the new Offset value should be currentOffset + Limit.
+	Offset uint `url:"offset,omitempty"`
+
+	// Total is the pagination parameter to request that the API return the
+	// total count of items in the response. If this field is omitted or set to
+	// false, the total number of results will not be sent back from the PagerDuty API.
+	//
+	// Setting this to true will slow down the API response times, and so it's
+	// recommended to omit it unless you've a specific reason for wanting the
+	// total count of items in the collection.
+	Total bool `url:"total,omitempty"`
+
 	Since       string   `url:"since,omitempty"`
 	Until       string   `url:"until,omitempty"`
 	DateRange   string   `url:"date_range,omitempty"`
@@ -116,14 +146,26 @@ type ListIncidentsOptions struct {
 
 // ConferenceBridge is a struct for the conference_bridge object on an incident
 type ConferenceBridge struct {
+	// ConferenceNumber is the phone number of the conference call for the
+	// conference bridge. Phone numbers should be formatted like
+	// +1 415-555-1212,,,,1234#, where a comma (,) represents a one-second
+	// wait and pound (#) completes access code input.
 	ConferenceNumber string `json:"conference_number,omitempty"`
-	ConferenceURL    string `json:"conference_url,omitempty"`
+
+	// ConferenceURL is the URL for the conference bridge. This could be a link
+	// to a video conference or Slack channel.
+	ConferenceURL string `json:"conference_url,omitempty"`
 }
 
-// ListIncidents lists existing incidents. It's recommended to use
-// ListIncidentsWithContext instead.
+// ListIncidents lists existing incidents.
+//
+// Deprecated: Use ListIncidentsWithContext instead.
 func (c *Client) ListIncidents(o ListIncidentsOptions) (*ListIncidentsResponse, error) {
 	return c.ListIncidentsWithContext(context.Background(), o)
+}
+
+func (c *Client) ListIncidentsPaginated(o ListIncidentsOptions) ([]Incident, error) {
+	return c.ListIncidentsPaginatedWithContext(context.Background(), o)
 }
 
 // ListIncidentsWithContext lists existing incidents.
@@ -146,6 +188,37 @@ func (c *Client) ListIncidentsWithContext(ctx context.Context, o ListIncidentsOp
 	return &result, nil
 }
 
+// ListIncidentsPaginated lists existing services processing paginated responses
+func (c *Client) ListIncidentsPaginatedWithContext(ctx context.Context, o ListIncidentsOptions) ([]Incident, error) {
+	v, err := query.Values(o)
+	if err != nil {
+		return nil, err
+	}
+
+	var incidents []Incident
+
+	responseHandler := func(response *http.Response) (APIListObject, error) {
+		var result ListIncidentsResponse
+		if err := c.decodeJSON(response, &result); err != nil {
+			return APIListObject{}, err
+		}
+
+		incidents = append(incidents, result.Incidents...)
+
+		return APIListObject{
+			More:   result.More,
+			Offset: result.Offset,
+			Limit:  result.Limit,
+		}, nil
+	}
+
+	if err := c.pagedGet(ctx, "/incidents?"+v.Encode(), responseHandler); err != nil {
+		return nil, err
+	}
+
+	return incidents, nil
+}
+
 // createIncidentResponse is returned from the API when creating a response.
 type createIncidentResponse struct {
 	Incident Incident `json:"incident"`
@@ -153,26 +226,44 @@ type createIncidentResponse struct {
 
 // CreateIncidentOptions is the structure used when POSTing to the CreateIncident API endpoint.
 type CreateIncidentOptions struct {
-	Type             string        `json:"type"`
-	Title            string        `json:"title"`
-	Service          *APIReference `json:"service"`
-	Priority         *APIReference `json:"priority"`
-	Urgency          string        `json:"urgency,omitempty"`
-	IncidentKey      string        `json:"incident_key,omitempty"`
-	Body             *APIDetails   `json:"body,omitempty"`
-	EscalationPolicy *APIReference `json:"escalation_policy,omitempty"`
-	Assignments      []Assignee    `json:"assignments,omitempty"`
+	// Type is the type of API object this is.
+	//
+	// Deprecated: Because the Type field can only have the value of "incident"
+	// when creating an incident, the CreateIncident* methods always set this
+	// value to "incident". Any other value will be overwritten. This will be
+	// removed in v2.0.0.
+	Type             string            `json:"type"`
+	Title            string            `json:"title"`
+	Service          *APIReference     `json:"service"`
+	Priority         *APIReference     `json:"priority"`
+	Urgency          string            `json:"urgency,omitempty"`
+	IncidentKey      string            `json:"incident_key,omitempty"`
+	Body             *APIDetails       `json:"body,omitempty"`
+	EscalationPolicy *APIReference     `json:"escalation_policy,omitempty"`
+	Assignments      []Assignee        `json:"assignments,omitempty"`
+	ConferenceBridge *ConferenceBridge `json:"conference_bridge,omitempty"`
 }
 
 // ManageIncidentsOptions is the structure used when PUTing updates to incidents to the ManageIncidents func
 type ManageIncidentsOptions struct {
-	ID               string        `json:"id"`
-	Type             string        `json:"type"`
-	Status           string        `json:"status,omitempty"`
-	Priority         *APIReference `json:"priority,omitempty"`
-	Assignments      []Assignee    `json:"assignments,omitempty"`
-	EscalationPolicy *APIReference `json:"escalation_policy,omitempty"`
-	Resolution       string        `json:"resolution,omitempty"`
+	ID string `json:"id"`
+
+	// Type is the type of API object this is.
+	//
+	// Deprecated: Because the Type field can only have the value of "incident"
+	// or "incident_reference" when managing an incident, the CreateIncident*
+	// methods always set this value to "incident" because this struct is not an
+	// incident_reference. Any other value will be overwritten. This will be
+	// removed in v2.0.0.
+	Type             string            `json:"type"`
+	Status           string            `json:"status,omitempty"`
+	Title            string            `json:"title,omitempty"`
+	Priority         *APIReference     `json:"priority,omitempty"`
+	Assignments      []Assignee        `json:"assignments,omitempty"`
+	EscalationLevel  uint              `json:"escalation_level,omitempty"`
+	EscalationPolicy *APIReference     `json:"escalation_policy,omitempty"`
+	Resolution       string            `json:"resolution,omitempty"`
+	ConferenceBridge *ConferenceBridge `json:"conference_bridge,omitempty"`
 }
 
 // MergeIncidentsOptions is the structure used when merging incidents with MergeIncidents func
@@ -182,8 +273,9 @@ type MergeIncidentsOptions struct {
 }
 
 // CreateIncident creates an incident synchronously without a corresponding
-// event from a monitoring service. It's recommended to use
-// CreateIncidentWithContext instead.
+// event from a monitoring service.
+//
+// Deprecated: Use CreateIncidentWithContext instead.
 func (c *Client) CreateIncident(from string, o *CreateIncidentOptions) (*Incident, error) {
 	return c.CreateIncidentWithContext(context.Background(), from, o)
 }
@@ -194,6 +286,9 @@ func (c *Client) CreateIncidentWithContext(ctx context.Context, from string, o *
 	h := map[string]string{
 		"From": from,
 	}
+
+	// see: https://github.com/PagerDuty/go-pagerduty/issues/390
+	o.Type = "incident"
 
 	d := map[string]*CreateIncidentOptions{
 		"incident": o,
@@ -213,7 +308,9 @@ func (c *Client) CreateIncidentWithContext(ctx context.Context, from string, o *
 }
 
 // ManageIncidents acknowledges, resolves, escalates, or reassigns one or more
-// incidents. It's recommended to use ManageIncidentsWithContext instead.
+// incidents.
+//
+// Deprecated: Use ManageIncidentsWithContext instead.
 func (c *Client) ManageIncidents(from string, incidents []ManageIncidentsOptions) (*ListIncidentsResponse, error) {
 	return c.ManageIncidentsWithContext(context.Background(), from, incidents)
 }
@@ -221,6 +318,11 @@ func (c *Client) ManageIncidents(from string, incidents []ManageIncidentsOptions
 // ManageIncidentsWithContext acknowledges, resolves, escalates, or reassigns
 // one or more incidents.
 func (c *Client) ManageIncidentsWithContext(ctx context.Context, from string, incidents []ManageIncidentsOptions) (*ListIncidentsResponse, error) {
+	// see: https://github.com/PagerDuty/go-pagerduty/issues/390
+	for i := range incidents {
+		incidents[i].Type = "incident"
+	}
+
 	d := map[string][]ManageIncidentsOptions{
 		"incidents": incidents,
 	}
@@ -243,7 +345,8 @@ func (c *Client) ManageIncidentsWithContext(ctx context.Context, from string, in
 }
 
 // MergeIncidents merges a list of source incidents into a specified incident.
-// It's recommended to use MergeIncidentsWithContext instead.
+//
+// Deprecated: Use MergeIncidentsWithContext instead.
 func (c *Client) MergeIncidents(from string, id string, sourceIncidents []MergeIncidentsOptions) (*Incident, error) {
 	return c.MergeIncidentsWithContext(context.Background(), from, id, sourceIncidents)
 }
@@ -271,8 +374,9 @@ func (c *Client) MergeIncidentsWithContext(ctx context.Context, from, id string,
 	return &result.Incident, nil
 }
 
-// GetIncident shows detailed information about an incident. It's recommended to
-// use GetIncidentWithContext instead.
+// GetIncident shows detailed information about an incident.
+//
+// Deprecated: Use GetIncidentWithContext instead.
 func (c *Client) GetIncident(id string) (*Incident, error) {
 	return c.GetIncidentWithContext(context.Background(), id)
 }
@@ -310,8 +414,9 @@ type CreateIncidentNoteResponse struct {
 	IncidentNote IncidentNote `json:"note"`
 }
 
-// ListIncidentNotes lists existing notes for the specified incident. It's
-// recommended to use ListIncidentNotesWithContext instead.
+// ListIncidentNotes lists existing notes for the specified incident.
+//
+// Deprecated: Use ListIncidentNotesWithContext instead.
 func (c *Client) ListIncidentNotes(id string) ([]IncidentNote, error) {
 	return c.ListIncidentNotesWithContext(context.Background(), id)
 }
@@ -368,7 +473,25 @@ type ListAlertsResponse struct {
 
 // ListIncidentAlertsOptions is the structure used when passing parameters to the ListIncidentAlerts API endpoint.
 type ListIncidentAlertsOptions struct {
-	APIListObject
+	// Limit is the pagination parameter that limits the number of results per
+	// page. PagerDuty defaults this value to 25 if omitted, and sets an upper
+	// bound of 100.
+	Limit uint `url:"limit,omitempty"`
+
+	// Offset is the pagination parameter that specifies the offset at which to
+	// start pagination results. When trying to request the next page of
+	// results, the new Offset value should be currentOffset + Limit.
+	Offset uint `url:"offset,omitempty"`
+
+	// Total is the pagination parameter to request that the API return the
+	// total count of items in the response. If this field is omitted or set to
+	// false, the total number of results will not be sent back from the PagerDuty API.
+	//
+	// Setting this to true will slow down the API response times, and so it's
+	// recommended to omit it unless you've a specific reason for wanting the
+	// total count of items in the collection.
+	Total bool `url:"total,omitempty"`
+
 	Statuses []string `url:"statuses,omitempty,brackets"`
 	SortBy   string   `url:"sort_by,omitempty"`
 	Includes []string `url:"include,omitempty,brackets"`
@@ -381,7 +504,8 @@ func (c *Client) ListIncidentAlerts(id string) (*ListAlertsResponse, error) {
 }
 
 // ListIncidentAlertsWithOpts lists existing alerts for the specified incident.
-// It's recommended to use ListIncidentAlertsWithContext instead.
+//
+// Deprecated: Use ListIncidentAlertsWithContext instead.
 func (c *Client) ListIncidentAlertsWithOpts(id string, o ListIncidentAlertsOptions) (*ListAlertsResponse, error) {
 	return c.ListIncidentAlertsWithContext(context.Background(), id, o)
 }
@@ -409,7 +533,8 @@ func (c *Client) ListIncidentAlertsWithContext(ctx context.Context, id string, o
 }
 
 // CreateIncidentNoteWithResponse creates a new note for the specified incident.
-// It's recommended to use CreateIncidentNoteWithContext instead.
+//
+// Deprecated: Use CreateIncidentNoteWithContext instead.
 func (c *Client) CreateIncidentNoteWithResponse(id string, note IncidentNote) (*IncidentNote, error) {
 	return c.CreateIncidentNoteWithContext(context.Background(), id, note)
 }
@@ -439,7 +564,7 @@ func (c *Client) CreateIncidentNoteWithContext(ctx context.Context, id string, n
 
 // CreateIncidentNote creates a new note for the specified incident.
 //
-// Deprecated: please use CreateIncidentNoteWithContext going forward
+// Deprecated: Use CreateIncidentNoteWithContext instead.
 func (c *Client) CreateIncidentNote(id string, note IncidentNote) error {
 	data := make(map[string]IncidentNote)
 	headers := make(map[string]string)
@@ -450,7 +575,9 @@ func (c *Client) CreateIncidentNote(id string, note IncidentNote) error {
 }
 
 // SnoozeIncidentWithResponse sets an incident to not alert for a specified
-// period of time. It's recommended to use SnoozeIncidentWithContext instead.
+// period of time.
+//
+// Deprecated: Use SnoozeIncidentWithContext instead.
 func (c *Client) SnoozeIncidentWithResponse(id string, duration uint) (*Incident, error) {
 	return c.SnoozeIncidentWithContext(context.Background(), id, duration)
 }
@@ -476,7 +603,7 @@ func (c *Client) SnoozeIncidentWithContext(ctx context.Context, id string, durat
 
 // SnoozeIncident sets an incident to not alert for a specified period of time.
 //
-// Deprecated: please use SnoozeIncidentWithContext going forward
+// Deprecated: Use SnoozeIncidentWithContext instead.
 func (c *Client) SnoozeIncident(id string, duration uint) error {
 	data := make(map[string]uint)
 	data["duration"] = duration
@@ -492,7 +619,25 @@ type ListIncidentLogEntriesResponse struct {
 
 // ListIncidentLogEntriesOptions is the structure used when passing parameters to the ListIncidentLogEntries API endpoint.
 type ListIncidentLogEntriesOptions struct {
-	APIListObject
+	// Limit is the pagination parameter that limits the number of results per
+	// page. PagerDuty defaults this value to 25 if omitted, and sets an upper
+	// bound of 100.
+	Limit uint `url:"limit,omitempty"`
+
+	// Offset is the pagination parameter that specifies the offset at which to
+	// start pagination results. When trying to request the next page of
+	// results, the new Offset value should be currentOffset + Limit.
+	Offset uint `url:"offset,omitempty"`
+
+	// Total is the pagination parameter to request that the API return the
+	// total count of items in the response. If this field is omitted or set to
+	// false, the total number of results will not be sent back from the PagerDuty API.
+	//
+	// Setting this to true will slow down the API response times, and so it's
+	// recommended to omit it unless you've a specific reason for wanting the
+	// total count of items in the collection.
+	Total bool `url:"total,omitempty"`
+
 	Includes   []string `url:"include,omitempty,brackets"`
 	IsOverview bool     `url:"is_overview,omitempty"`
 	TimeZone   string   `url:"time_zone,omitempty"`
@@ -501,7 +646,8 @@ type ListIncidentLogEntriesOptions struct {
 }
 
 // ListIncidentLogEntries lists existing log entries for the specified incident.
-// It's recommended to use ListIncidentLogEntriesWithContext instead.
+//
+// Deprecated: Use ListIncidentLogEntriesWithContext instead.
 func (c *Client) ListIncidentLogEntries(id string, o ListIncidentLogEntriesOptions) (*ListIncidentLogEntriesResponse, error) {
 	return c.ListIncidentLogEntriesWithContext(context.Background(), id, o)
 }
@@ -550,11 +696,6 @@ type ResponderRequestTarget struct {
 	Responders IncidentResponders `json:"incident_responders"`
 }
 
-// ResponderRequestTargets is a wrapper for a ResponderRequestTarget.
-type ResponderRequestTargets struct {
-	Target ResponderRequestTarget `json:"responder_request_target"`
-}
-
 // ResponderRequestOptions defines the input options for the Create Responder function.
 type ResponderRequestOptions struct {
 	From        string                   `json:"-"`
@@ -565,15 +706,16 @@ type ResponderRequestOptions struct {
 
 // ResponderRequest contains the API structure for an incident responder request.
 type ResponderRequest struct {
-	Incident    Incident                `json:"incident"`
-	Requester   User                    `json:"requester,omitempty"`
-	RequestedAt string                  `json:"request_at,omitempty"`
-	Message     string                  `json:"message,omitempty"`
-	Targets     ResponderRequestTargets `json:"responder_request_targets"`
+	Incident    Incident                 `json:"incident"`
+	Requester   User                     `json:"requester,omitempty"`
+	RequestedAt string                   `json:"request_at,omitempty"`
+	Message     string                   `json:"message,omitempty"`
+	Targets     []ResponderRequestTarget `json:"responder_request_targets"`
 }
 
 // ResponderRequest will submit a request to have a responder join an incident.
-// It's recommended to use ResponderRequestWithContext instead.
+//
+// Deprecated: Use ResponderRequestWithContext instead.
 func (c *Client) ResponderRequest(id string, o ResponderRequestOptions) (*ResponderRequestResponse, error) {
 	return c.ResponderRequestWithContext(context.Background(), id, o)
 }
@@ -597,56 +739,76 @@ func (c *Client) ResponderRequestWithContext(ctx context.Context, id string, o R
 	return &result, nil
 }
 
-// GetIncidentAlert gets the alert that triggered the incident. It's recommended
-// to use GetIncidentAlertWithContext instead.
-func (c *Client) GetIncidentAlert(incidentID, alertID string) (*IncidentAlertResponse, *http.Response, error) {
-	return c.getIncidentAlertWithContext(context.Background(), incidentID, alertID)
+// GetIncidentAlert gets the alert that triggered the incident.
+//
+// Deprecated: Use GetIncidentAlertWithContext instead.
+func (c *Client) GetIncidentAlert(incidentID, alertID string) (*IncidentAlertResponse, error) {
+	return c.GetIncidentAlertWithContext(context.Background(), incidentID, alertID)
 }
 
 // GetIncidentAlertWithContext gets the alert that triggered the incident.
 func (c *Client) GetIncidentAlertWithContext(ctx context.Context, incidentID, alertID string) (*IncidentAlertResponse, error) {
-	iar, _, err := c.getIncidentAlertWithContext(context.Background(), incidentID, alertID)
-	return iar, err
-}
-
-func (c *Client) getIncidentAlertWithContext(ctx context.Context, incidentID, alertID string) (*IncidentAlertResponse, *http.Response, error) {
 	resp, err := c.get(ctx, "/incidents/"+incidentID+"/alerts/"+alertID)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 
 	var result IncidentAlertResponse
 	if err = c.decodeJSON(resp, &result); err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 
-	return &result, resp, nil
+	return &result, nil
 }
 
-// ManageIncidentAlerts allows you to manage the alerts of an incident. It's
-// recommended to use ManageIncidentAlertsWithContext instead.
-func (c *Client) ManageIncidentAlerts(incidentID string, alerts *IncidentAlertList) (*ListAlertsResponse, *http.Response, error) {
-	return c.manageIncidentAlertsWithContext(context.Background(), incidentID, alerts)
-}
+// ManageIncidentAlerts allows you to manage the alerts of an incident.
+func (c *Client) ManageIncidentAlerts(ctx context.Context, incidentID, from string, alerts *IncidentAlertList) (*ListAlertsResponse, error) {
+	h := map[string]string{
+		"From": from,
+	}
 
-// ManageIncidentAlertsWithContext allows you to manage the alerts of an incident.
-func (c *Client) ManageIncidentAlertsWithContext(ctx context.Context, incidentID string, alerts *IncidentAlertList) (*ListAlertsResponse, error) {
-	lar, _, err := c.manageIncidentAlertsWithContext(context.Background(), incidentID, alerts)
-	return lar, err
-}
-
-func (c *Client) manageIncidentAlertsWithContext(ctx context.Context, incidentID string, alerts *IncidentAlertList) (*ListAlertsResponse, *http.Response, error) {
-	resp, err := c.put(ctx, "/incidents/"+incidentID+"/alerts/", alerts, nil)
+	resp, err := c.put(ctx, "/incidents/"+incidentID+"/alerts/", alerts, h)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 
 	var result ListAlertsResponse
 	if err = c.decodeJSON(resp, &result); err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 
-	return &result, resp, nil
+	return &result, nil
 }
 
-/* TODO: Create Status Updates */
+// IncidentStatusUpdate is a status update for the specified incident.
+type IncidentStatusUpdate struct {
+	ID        string    `json:"id"`
+	Message   string    `json:"message"`
+	CreatedAt string    `json:"created_at"`
+	Sender    APIObject `json:"sender"`
+}
+
+// CreateIncidentStatusUpdate creates a new status update for the specified incident.
+func (c *Client) CreateIncidentStatusUpdate(ctx context.Context, id string, from string, message string) (IncidentStatusUpdate, error) {
+	d := map[string]string{
+		"message": message,
+	}
+
+	h := map[string]string{
+		"From": from,
+	}
+
+	resp, err := c.post(ctx, "/incidents/"+id+"/status_updates", d, h)
+	if err != nil {
+		return IncidentStatusUpdate{}, err
+	}
+
+	var result struct {
+		IncidentStatusUpdate IncidentStatusUpdate `json:"status_update"`
+	}
+	if err = c.decodeJSON(resp, &result); err != nil {
+		return IncidentStatusUpdate{}, err
+	}
+
+	return result.IncidentStatusUpdate, nil
+}
